@@ -679,6 +679,74 @@ def isOrComplement (x y : BoolVal) (tp : BoolType) : Bool :=
   | eq_false x, eq_true y, _ => x == y
   | _, _, _ => false
 
+namespace BoolVal
+
+open BoolType
+
+variable (tp : BoolType)
+
+def decide_true := ∀(tp : BoolType), decide (trueVal tp) = decide (trueVal bool)
+
+def Rules : List Prop := [
+  ∀tp,     decide (trueVal tp)  = trueVal bool,
+  ∀tp,     decide (falseVal tp) = falseVal bool,
+  ∀tp x,   decide (not x tp) = decide x,
+  ∀tp x y, decide (and x y tp) = (decide x &&& decide y),
+  ∀tp x y, decide (or  x y tp) = (decide x ||| decide y),
+  ∀x y,    decide (implies  x y) = ~(decide x) ||| decide y,
+  ∀x y,    decide (eq x y .iffProp) = eq (decide x) (decide y) .beqBool,
+  ∀x op,   decide (eq x (trueVal  bool) op) = x,
+  ∀x op,   decide (eq x (falseVal bool) op) = ~x,
+  ∀x y,    decide (eq x y .eqBool)  = eq x y .beqBool,
+  ∀x y,    decide (eq x y .eqProp)  = eq (decide x) (decide y) .beqBool,
+  ∀x y,    decide (eq x y .iffProp) = eq (decide x) (decide y) .beqBool,
+  ∀c t f,  decide (ite c t f .iteProp) = ite c (decide t) (decide f) .iteBool,
+  True
+]
+
+structure Match where
+  lctx : LocalContext
+  lhs : Expr
+  rhs : Expr
+
+instance : BEq Match where
+  beq _ _ := false -- FIXME?
+
+def matchDtConfig : WhnfCoreConfig := {}
+
+#print Eq
+#print forallMetaTelescopeReducing
+def addMatchProp (stx : Syntax) (d : DiscrTree Match) (p : Expr) : MetaM (DiscrTree Match) := do
+  let (args, _, eq) ← withReducible (forallMetaTelescopeReducing p)
+  let pat ←
+    match eq with
+    | .app (.app (.app (.const `Eq [lvl]) tp) lhs) rhs => pure lhs
+    | _ =>
+      throwErrorAt stx m!"Could not interpret {eq} as equation."
+
+
+  let keys ←  DiscrTree.mkPath pat matchDtConfig
+  let ma : Match := sorry
+  pure <| d.insertCore keys ma
+
+def mkDiscrTree (rules : List Prop) : MetaM (DiscrTree Match):= do
+  rules.foldlM (init := DiscrTree.empty) addMatchProp
+
+
+partial def simp_from_rules [h : ToExpr BoolVal] (rules : List Prop) (v : BoolVal) : MetaM BoolVal := do
+  let t ← mkDiscrTree rules
+  let e := toExpr v
+
+
+  -- Discrimination tree
+  -- Lift
+  sorry
+
+
+
+end BoolVal
+
+
 partial def simp (v : BoolVal) : BoolVal :=
   let v := map simp v
   match v with
@@ -687,8 +755,6 @@ partial def simp (v : BoolVal) : BoolVal :=
       match p with
       | .trueVal  _ => .trueVal  .bool
       | .falseVal _ => .falseVal .bool
-      | .var _ => v
-      | .boolToProp _ => panic! "Expected boolToProp to simplify away"
       | .not x _   => simp <| ~(.decide x)
       | .and x y _ => simp <| (.decide x) &&& (.decide y)
       | .or x y _  => simp <| (.decide x) ||| (.decide y)
@@ -708,6 +774,8 @@ partial def simp (v : BoolVal) : BoolVal :=
         match op with
         | .iteProp => simp <| .ite c (.decide t) (.decide f) .iteBool
         | _ => v
+      | .var _ => v
+      | .boolToProp _ => panic! "Expected boolToProp to simplify away"
       | .decide _ | .eq _ _ _ =>
         panic! s!"Unexpected prop {repr p} when bool expected."
   | .not t _ =>
