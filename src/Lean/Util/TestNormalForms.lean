@@ -25,12 +25,18 @@ def Op.map (op : Op x val) (f : x → y) : Op y val :=
 /--
 Contextual information needed to generate terms.
 -/
-structure GenCtx (val : Type) where
+structure GenCtx (term : Type) where
   -- Maps type indices to operator for corresponding type.
   -- Types use type indices.
-  ops : Array (Array (Op Nat val))
+  ops : Array (Array (Op Nat term))
+  /-- Maps type indices to variables for that type. -/
+  vars : Array (Array term)
   /- Operators to use for patterns at top of terms -/
-  topOps : Array (Op Nat val)
+  topOps : Array (Op Nat term)
+  /- Returns the expected reduction of a term -/
+  expected : term → term
+  /- Predicate that returns true if terms are equal-/
+  eq : term → term → Bool
   /-- Maximum term size -/
   maxTermSize : Nat
   /-- Maximum depth of terms -/
@@ -41,13 +47,11 @@ structure GenCtx (val : Type) where
   lctx : LocalContext
   /- Local instances for variables -/
   linst : LocalInstances
-  /-- Maps type indices to variables for that type. -/
-  vars : Array (Array val)
 
 namespace GenCtx
 
 /-- `var ctx tp idx` returns a term denoting `i`th variable with type `tp`. -/
-def var (ctx : GenCtx val) (tp : Nat) (idx : Nat) : Option val :=
+def var (ctx : GenCtx term) (tp : Nat) (idx : Nat) : Option term :=
   if g : tp < ctx.vars.size then
     let a := ctx.vars[tp]'g
     if h : idx < a.size then
@@ -157,26 +161,31 @@ def pop (s : TermGen term) : Option (Nat × PartialTerm term × TermGen term) :=
       let tp := app.op.args[app.terms.size]!
       some (tp, next, { sofar, pending })
 
-/- `push s next v` adds the result of `next.push v` to the state. -/
-def push (s : TermGen term) (next : PartialTerm term) (v : term) : TermGen term :=
-  let { sofar, pending } := s
-  match next.push v with
-  | .inl v => { sofar := sofar.push v, pending }
-  | .inr next => { sofar, pending := pending.push next }
-
-def pushOp (s : TermGen term) (ctx : GenCtx term) (next : PartialTerm term) (op : Op Nat term) :=
-  if op.args.isEmpty then
-    s.push next (op.apply #[])
-  else if op.args.size ≤ next.remTermSize ∧ next.termStack.size + 1 < ctx.maxDepth then
-    { s with pending := s.pending.push (next.pushOp op) }
-  else
-    s
-
-def add (s : TermGen term) (val : term ⊕ PartialTerm term) : TermGen term :=
-  let { sofar, pending } := s
+def add (gen : TermGen term)  (val : term ⊕ PartialTerm term) : TermGen term :=
+  let { sofar, pending } := gen
   match val with
-  | .inl v => { sofar := sofar.push v, pending }
+  | .inl v =>  { sofar := sofar.push v, pending }
   | .inr p => { sofar, pending := pending.push p }
+
+/-
+`push s next v` adds the result of `next.push v` to the state.
+
+This only adds terms that are irreducible.
+-/
+def push (gen : TermGen term) (ctx : GenCtx term) (next : PartialTerm term) (v : term) : TermGen term :=
+  let exp := ctx.expected v
+  if ctx.eq exp v then
+    gen.add (next.push v)
+  else
+    gen
+
+def pushOp (gen : TermGen term) (ctx : GenCtx term) (next : PartialTerm term) (op : Op Nat term) :=
+  if op.args.isEmpty then
+    gen.push ctx next (op.apply #[])
+  else if op.args.size ≤ next.remTermSize ∧ next.termStack.size + 1 < ctx.maxDepth then
+    { gen with pending := gen.pending.push (next.pushOp op) }
+  else
+    gen
 
 /-- Create state that will explore all terms in context -/
 def addOpInstances (s : TermGen term) (ctx : GenCtx term) (op : Op Nat term) : TermGen term :=
@@ -194,23 +203,28 @@ Generate terms until we reach the limit.
 partial
 def generateTerms
     (ctx : GenCtx term)
-    (s : TermGen term)
+    (gen : TermGen term)
     (limit : Nat := 0) :
     Array term × TermGen term :=
-  if limit > 0 ∧ s.sofar.size ≥ limit then
-    (s.sofar, { s with sofar := #[] })
+  if limit > 0 ∧ gen.sofar.size ≥ limit then
+    -- Stop if we hit term limit
+    (gen.sofar, { gen with sofar := #[] })
   else
-    match s.pop with
-    | none => (s.sofar, { s with sofar := #[] })
-    | some (tp, next, s) =>
-      let addVar (next : PartialTerm term) (i : Nat) (s : TermGen term) : TermGen term :=
+    match gen.pop with
+    | none =>
+      -- stop when out of terms
+      (gen.sofar, { gen with sofar := #[] })
+    | some (tp, next, gen) =>
+      -- Add previously used variables to term
+      let addVar (next : PartialTerm term) (i : Nat) (gen : TermGen term) : TermGen term :=
+            -- If the previous variable i matches type, then add it to generator
             if next.usedVars[i]! = tp then
               match ctx.var tp i with
-              | some v => s.push next v
-              | none => s
+              | some v => gen.push ctx next v
+              | none => gen
             else
-              s
-      let s := next.usedVars.size.fold (init := s) (addVar next)
+              gen
+      let s := next.usedVars.size.fold (init := gen) (addVar next)
       let s :=
         let var := next.usedVars.size
         if var < ctx.maxVarCount then
@@ -271,24 +285,25 @@ instance : Hashable (VarDecl tp) where
 /--
 
 -/
-class GenTerm (term : Type) (type : outParam Type) where
+class GenTerm (term : Type) (type : outParam Type) extends BEq term where
   mkVar : VarDecl type → term
   render : term → TermElabM Term
 
-def mkCtx [BEq tp] [Hashable tp]
+def mkCtx [BEq tp] [Hashable tp] [BEq term]
     (types : Array tp)
-    (ops : List (Op tp val))
+    (ops : List (Op tp term))
     (varGen : List (tp × CoreM Command))
-    (mkVar : VarDecl tp → val)
+    (mkVar : VarDecl tp → term)
+    (expected : term → term)
     (stats : GenStats)
-    (topOps : List (Op tp val) := ops) : CommandElabM (GenCtx val) := do
+    (topOps : List (Op tp term) := ops) : CommandElabM (GenCtx term) := do
   let typeMap : HashMap tp Nat := Nat.fold (n := types.size) (init := {}) fun i s =>
         if p : i < types.size then
           s.insert types[i] i
         else
           s
   let typeFn (t : tp) := typeMap.findD t 0
-  let addOp (a : Array (Array (Op Nat val))) (op : Op tp val) :=
+  let addOp (a : Array (Array (Op Nat term))) (op : Op tp term) :=
         let op := op.map typeFn
         a.modify op.result (·.push op)
   let init := Array.ofFn (n := types.size) (fun _ => #[])
@@ -304,7 +319,7 @@ def mkCtx [BEq tp] [Hashable tp]
     let maxRecDepth := coreCtx.maxRecDepth
     let cmdCtx : Command.Context := { fileName, fileMap, tacticCache? := none }
     let cmdState : Command.State := { env, maxRecDepth }
-    let addVars (p : LocalContext × LocalInstances × Array (Array val))
+    let addVars (p : LocalContext × LocalInstances × Array (Array term))
                 (q : tp × CoreM Command) :
                 CoreM (LocalContext × LocalInstances × _) := do
           let (lctx, linst, a) := p
@@ -319,7 +334,7 @@ def mkCtx [BEq tp] [Hashable tp]
   let maxTermSize : Nat := stats.maxTermSize
   let maxDepth : Nat := stats.maxDepth
   let maxVarCount : Nat := stats.maxVarCount
-  pure { ops, topOps, maxTermSize, maxDepth, maxVarCount, lctx, linst, vars }
+  pure { ops, vars, expected := @expected, eq := BEq.beq, topOps, maxTermSize, maxDepth, maxVarCount, lctx, linst }
 
 /-
 runTest
@@ -384,18 +399,18 @@ operators and variable constructors for building terms up.
 
 `stats` controls parameters on the size of terms generated.
 -/
-partial def testNormalForms [BEq type] [Hashable type] [GenTerm term type]
+partial def testNormalForms {val type : Type} [BEq type] [Hashable type] [GenTerm val type]
       (types : List type)
-      (ops : List (Op type term))
+      (ops : List (Op type val))
       (vars : List (type × CoreM Command))
-      (expected : term → term)
+      (expected : val → val)
       (stats : GenStats)
       (tac : Option Syntax.Tactic := none)
-      (topOps : List (Op type term) := ops)
+      (topOps : List (Op type val) := ops)
       (concurrent : Bool := true) : CommandElabM Unit := do
 
   let tac ← tac.getDM `(tactic|try simp)
-  let ctx ← mkCtx (types := types.toArray) (ops := ops) (topOps := topOps) (varGen := vars) (mkVar := GenTerm.mkVar) (stats := stats)
+  let ctx ← mkCtx (types := types.toArray) (ops := ops) (topOps := topOps) (varGen := vars) (mkVar := GenTerm.mkVar) expected (stats := stats)
 
   let cmdCtx : Command.Context ← read
   let s ← get
@@ -416,7 +431,7 @@ partial def testNormalForms [BEq type] [Hashable type] [GenTerm term type]
   let gen := TermGen.init ctx
   if concurrent then
     let limit := 800
-    let rec loop (gen : TermGen term) (cnt : Nat) (tasks : Array (Task (Except Exception MessageLog))) : BaseIO (Nat × Array (Task _)) := do
+    let rec loop (gen : TermGen val) (cnt : Nat) (tasks : Array (Task (Except Exception MessageLog))) : BaseIO (Nat × Array (Task _)) := do
       if gen.isEmpty then
         return (cnt, tasks)
       else
@@ -446,7 +461,7 @@ partial def testNormalForms [BEq type] [Hashable type] [GenTerm term type]
           modify fun s => { s with messages := s.messages ++ m }
   else
     let r ← runTermElabM cctx cstate mctx <|
-      let (terms, _) := generateTerms ctx gen
+      let (terms, _) := generateTerms ctx gen (limit := 0)
       for tm in terms do
         if ← IO.checkCanceled then
           break
